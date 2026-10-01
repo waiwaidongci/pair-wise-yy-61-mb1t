@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useDispatch, useSelector } from 'react-redux';
 import { BrowserRouter, NavLink, Navigate, Route, Routes, useNavigate } from 'react-router-dom';
 import {
@@ -43,14 +43,85 @@ import {
   PeopleRegular,
   WarningRegular
 } from '@fluentui/react-icons';
-import { useGetWorkPackageQuery, useSubmitCardMutation } from './api';
-import { authorizeOverride, refreshVersion, releasePackage, selectCard, setConflict, signStage, toggleOffline, updateCard, type RootState } from './store';
+import { useGetWorkPackageQuery, useImportOfflineChangesMutation, useSubmitCardMutation } from './api';
+import {
+  applyMergeResults,
+  authorizeOverride,
+  markImportFailed,
+  refreshVersion,
+  releasePackage,
+  resolveConflict,
+  selectCard,
+  setConflict,
+  signStage,
+  toggleOffline,
+  updateCard,
+  updateEvidence,
+  type RootState
+} from './store';
 
 type NavItem = { path: string; label: string; icon: ReactNode };
+
+type MergeFilter = 'all' | 'failed' | string;
+type MergeControl = {
+  flush: (filter?: MergeFilter) => Promise<void>;
+  isImporting: boolean;
+};
+
+const noopMerge: MergeControl = { flush: async () => undefined, isImporting: false };
+const MergeControlContext = createContext<MergeControl>(noopMerge);
+
+/** 回网后把离线改动逐项并入；导入失败则保留失败项，可按原请求编号重试 */
+function useOfflineMerge(): MergeControl {
+  const dispatch = useDispatch();
+  const offline = useSelector((root: RootState) => root.maintenance.offline);
+  const outbox = useSelector((root: RootState) => root.maintenance.outbox);
+  const [importChanges, { isLoading }] = useImportOfflineChangesMutation();
+  const outboxRef = useRef(outbox);
+  outboxRef.current = outbox;
+
+  const flush = useCallback(
+    async (filter: MergeFilter = 'all') => {
+      const items = outboxRef.current.filter((item) => {
+        if (item.status === '已并入') return false;
+        if (filter === 'all') return true;
+        if (filter === 'failed') return item.status === '失败';
+        return item.requestId === filter;
+      });
+      if (items.length === 0) return;
+      try {
+        const result = await importChanges(items).unwrap();
+        dispatch(applyMergeResults({ outcomes: result.outcomes, serverRevision: result.serverRevision }));
+      } catch (error) {
+        const message = (error as { data?: { message?: string } })?.data?.message ?? '导入失败，请重试。';
+        dispatch(markImportFailed({ requestIds: items.map((item) => item.requestId), error: message }));
+      }
+    },
+    [dispatch, importChanges]
+  );
+
+  const prevOffline = useRef(offline);
+  const didMount = useRef(false);
+  useEffect(() => {
+    if (!didMount.current) {
+      didMount.current = true;
+      if (!offline && outboxRef.current.some((item) => item.status === '待并入')) void flush();
+      return;
+    }
+    if (prevOffline.current && !offline) void flush();
+    prevOffline.current = offline;
+  }, [offline, flush]);
+
+  return { flush, isImporting: isLoading };
+}
 
 function Shell({ children }: { children: ReactNode }) {
   const state = useSelector((root: RootState) => root.maintenance);
   const dispatch = useDispatch();
+  const merge = useOfflineMerge();
+  const pendingCount = state.outbox.filter((item) => item.status === '待并入').length;
+  const conflictCount = state.outbox.filter((item) => item.status === '待确认').length;
+  const failedCount = state.outbox.filter((item) => item.status === '失败').length;
   const nav: NavItem[] = [
     { path: '/', label: '工作包总览', icon: <ClipboardTaskListLtrRegular /> },
     { path: '/execution', label: '工卡执行', icon: <BookOpenRegular /> },
@@ -58,19 +129,23 @@ function Shell({ children }: { children: ReactNode }) {
     { path: '/audit', label: '审计与差异', icon: <HistoryRegular /> }
   ];
   return (
-    <div className="app-shell">
-      <header className="app-header">
-        <div className="brand">
-          <div className="brand-icon"><NavigationRegular /></div>
-          <div><strong>航空定检执行台</strong><span>Maintenance Work Package</span></div>
-        </div>
-        <div className="aircraft-chip"><span>B-7891</span><strong>B737-800</strong><Badge appearance="tint" color="brand">48A 定检</Badge></div>
-        <div className="header-spacer" />
-        <button className={`sync-status ${state.offline ? 'offline' : ''}`} onClick={() => dispatch(toggleOffline())}>
-          {state.offline ? <CloudOffRegular /> : <CloudArrowUpRegular />}<span>{state.offline ? '离线暂存' : `已同步 R${state.syncVersion}`}</span>
-        </button>
-        <div className="user-chip"><span>执行人员</span><strong>宋杰 · 机械</strong></div>
-      </header>
+    <MergeControlContext.Provider value={merge}>
+      <div className="app-shell">
+        <header className="app-header">
+          <div className="brand">
+            <div className="brand-icon"><NavigationRegular /></div>
+            <div><strong>航空定检执行台</strong><span>Maintenance Work Package</span></div>
+          </div>
+          <div className="aircraft-chip"><span>B-7891</span><strong>B737-800</strong><Badge appearance="tint" color="brand">48A 定检</Badge></div>
+          <div className="header-spacer" />
+          {!state.offline && conflictCount > 0 && <Badge appearance="filled" color="danger" className="merge-badge">{conflictCount} 项待确认</Badge>}
+          {!state.offline && failedCount > 0 && <Badge appearance="filled" color="danger" className="merge-badge">{failedCount} 项导入失败</Badge>}
+          {pendingCount > 0 && <Badge appearance="tint" color="warning" className="merge-badge">{pendingCount} 项待并入</Badge>}
+          <button className={`sync-status ${state.offline ? 'offline' : ''}`} onClick={() => dispatch(toggleOffline())}>
+            {state.offline ? <CloudOffRegular /> : <CloudArrowUpRegular />}<span>{state.offline ? '离线暂存' : `已同步 R${state.syncVersion}`}</span>
+          </button>
+          <div className="user-chip"><span>执行人员</span><strong>宋杰 · 机械</strong></div>
+        </header>
       <div className="shell-grid">
         <aside className="side-nav">
           <div className="package-summary">
@@ -82,7 +157,8 @@ function Shell({ children }: { children: ReactNode }) {
         </aside>
         <main>{children}</main>
       </div>
-    </div>
+      </div>
+    </MergeControlContext.Provider>
   );
 }
 
@@ -157,6 +233,12 @@ function Execution() {
       dispatch(setConflict('关键步骤必须完成见证确认。'));
       return;
     }
+    if (state.offline) {
+      // 断网：跳过服务器校验，工卡改动记入离线队列，回网后逐项并入
+      dispatch(updateCard({ measurement, finding, status: '已完成' }));
+      dispatch(setConflict(''));
+      return;
+    }
     if (state.syncVersion !== state.serverVersion) {
       dispatch(setConflict('检测到冲突提交：本地版本与服务器版本不一致，请刷新后重试。'));
       return;
@@ -169,6 +251,9 @@ function Execution() {
       dispatch(updateCard({ measurement, finding, status: '已完成' }));
       dispatch(setConflict(''));
     }
+  };
+  const updateEvidenceFile = () => {
+    dispatch(updateEvidence(card.id));
   };
   return (
     <div className="page">
@@ -186,7 +271,7 @@ function Execution() {
             <Field label="测量值" hint={card.tolerance} validationState={toleranceIssue ? 'error' : 'none'} validationMessage={toleranceIssue ? '低于最低接受值 2850 psi' : undefined}><Input value={measurement} onChange={(_, data) => setMeasurement(data.value)} contentBefore={<GaugeRegular />} /></Field>
             <Field label="耗材 / 航材"><Input value={consumable} onChange={(_, data) => setConsumable(data.value)} placeholder="输入件号或耗材批次" /></Field>
             <Field label="发现与处置" className="wide-field"><Textarea value={finding} onChange={(_, data) => setFinding(data.value)} resize="vertical" placeholder="正常或填写缺陷、处置措施" /></Field>
-            <Field label="证据附件" className="wide-field"><div className="upload-zone"><CloudArrowUpRegular /><strong>拖入照片、测试记录或报告</strong><span>已关联 3 个证据 · 支持 JPG / PDF / TXT</span></div></Field>
+            <Field label="证据附件" className="wide-field"><button type="button" className="upload-zone" onClick={updateEvidenceFile}><CloudArrowUpRegular /><strong>拖入照片、测试记录或报告（点击更新证据）</strong><span>已关联 3 个证据 · 当前第 {card.evidenceVersion + 1} 版 · 支持 JPG / PDF / TXT</span></button></Field>
           </div>
           <label className="witness-check"><Checkbox checked={witness} onChange={(_, data) => setWitness(Boolean(data.checked))} /><span><strong>见证人已现场确认</strong><small>要求：{card.witness}</small></span></label>
         </section>
@@ -207,9 +292,15 @@ function Release() {
   const [tab, setTab] = useState('open');
   const blockers = state.cards.filter((card) => card.status !== '已完成' && card.status !== '未开始');
   const allSigned = state.signatures.every((item) => item.status === '已签署');
+  const pendingMerge = state.outbox.filter((item) => item.status === '待并入').length;
+  const conflictCount = state.outbox.filter((item) => item.status === '待确认').length;
+  const failedCount = state.outbox.filter((item) => item.status === '失败').length;
   return (
     <div className="page">
       <PageHeading eyebrow="RELEASE REVIEW / B-7891" title="放行审阅" description="核对未关闭项目、重复缺陷、关键证据与阶段签字。" actions={<Button appearance="primary" icon={<LockClosedRegular />} disabled={!allSigned || blockers.some((card) => card.status === '待授权')} onClick={() => dispatch(releasePackage())}>{state.released ? '工作包已锁定' : '锁定并放行'}</Button>} />
+      {state.releaseRolledBack && !state.released && <MessageBar intent="warning" className="top-message"><MessageBarBody><strong>放行基线已退回审阅：</strong>证据更新后相关阶段需重新签署，放行基线不得保持锁定，请重新核对后放行。</MessageBarBody></MessageBar>}
+      {!state.offline && (conflictCount > 0 || failedCount > 0) && <MessageBar intent="error" className="top-message"><MessageBarBody><strong>离线合并未完成：</strong>{conflictCount} 项待确认、{failedCount} 项导入失败，放行门禁可能不准确，请先在「审计与差异」中处理。</MessageBarBody></MessageBar>}
+      {state.offline && pendingMerge > 0 && <MessageBar intent="warning" className="top-message"><MessageBarBody><strong>离线暂存中：</strong>{pendingMerge} 项改动待回网并入，期间放行结论仅为本地草稿。</MessageBarBody></MessageBar>}
       {state.released && <MessageBar intent="success" className="top-message"><MessageBarBody>工作包已锁定，形成只读放行基线并纳入审计记录。</MessageBarBody></MessageBar>}
       <div className="release-grid">
         <section className="panel release-main">
@@ -226,6 +317,61 @@ function Release() {
         </aside>
       </div>
     </div>
+  );
+}
+
+function mergeTypeLabel(type: OfflineChangeType) {
+  return type === 'card' ? '工卡改动' : type === 'signature' ? '签字尝试' : type === 'evidence' ? '证据更新' : '放行锁定';
+}
+
+function mergeStatusLabel(status: OfflineChangeStatus) {
+  return status === '待并入' ? '待并入' : status === '已并入' ? '已并入' : status === '待确认' ? '待确认' : '失败';
+}
+
+type OfflineChangeType = 'card' | 'signature' | 'evidence' | 'release';
+type OfflineChangeStatus = '待并入' | '已并入' | '待确认' | '失败';
+
+function MergeQueue() {
+  const state = useSelector((root: RootState) => root.maintenance);
+  const dispatch = useDispatch();
+  const { flush, isImporting } = useContext(MergeControlContext);
+  const pending = state.outbox.filter((item) => item.status === '待并入');
+  const failed = state.outbox.filter((item) => item.status === '失败');
+  const conflict = state.outbox.filter((item) => item.status === '待确认');
+  return (
+    <section className="panel merge-panel">
+      <div className="panel-head">
+        <div><h2>离线合并队列</h2><span>断网期间记下的工卡改动、签字尝试与基线版本，回网后逐项并入；同一项两边都改过则保留待确认</span></div>
+        <div className="merge-actions">
+          <Button appearance="secondary" size="small" icon={<ArrowSyncRegular />} disabled={isImporting || pending.length + failed.length === 0} onClick={() => void flush('all')}>全部并入</Button>
+          <Button appearance="primary" size="small" icon={<ArrowDownloadRegular />} disabled={isImporting || failed.length === 0} onClick={() => void flush('failed')}>按原编号重试失败项</Button>
+        </div>
+      </div>
+      {state.offline && <MessageBar intent="warning" className="merge-offline-bar"><MessageBarBody><strong>当前离线：</strong>以下改动仅保存在本地草稿，回网后自动并入。</MessageBarBody></MessageBar>}
+      <div className="merge-list">
+        {state.outbox.length === 0 && <div className="merge-empty">暂无离线改动。断网时的工卡改动、签字尝试与证据更新会在此排队。</div>}
+        {state.outbox.map((item) => (
+          <div className={`merge-row status-${item.status}`} key={item.requestId}>
+            <span className={`merge-status ${item.status}`}>{mergeStatusLabel(item.status)}</span>
+            <div className="merge-body">
+              <strong>{item.requestId} · {item.label}</strong>
+              <small>{mergeTypeLabel(item.type)} · 基线 R{item.baseVersion} · {item.createdAt} · 已重试 {item.attempts} 次</small>
+              {item.type === 'card' && <small className="merge-payload">改动内容：{Object.entries(item.payload).map(([key, value]) => `${key}=${String(value)}`).join('，')}</small>}
+              {item.status === '待确认' && <p className="merge-conflict">{item.serverReason}{item.serverValue ? <span className="merge-server-value">服务器最新值：{item.serverValue}</span> : null}</p>}
+              {item.status === '失败' && <p className="merge-error">{item.error}</p>}
+              {item.status === '待确认' && (
+                <div className="merge-row-actions">
+                  <Button size="small" appearance="primary" onClick={() => dispatch(resolveConflict({ requestId: item.requestId, keepLocal: true }))}>保留现场改动</Button>
+                  <Button size="small" appearance="secondary" onClick={() => dispatch(resolveConflict({ requestId: item.requestId, keepLocal: false }))}>采用服务器版本</Button>
+                </div>
+              )}
+              {item.status === '失败' && <div className="merge-row-actions"><Button size="small" appearance="secondary" disabled={isImporting} onClick={() => void flush(item.requestId)}>按原请求编号重试</Button></div>}
+            </div>
+          </div>
+        ))}
+      </div>
+      <div className="merge-foot"><span>待并入 {pending.length}</span><span>待确认 {conflict.length}</span><span>失败 {failed.length}</span><span>已并入 {state.outbox.filter((item) => item.status === '已并入').length}</span></div>
+    </section>
   );
 }
 
@@ -249,6 +395,7 @@ function Audit() {
   return (
     <div className="page">
       <PageHeading eyebrow="AUDIT / VERSION CONTROL" title="审计与版本差异" description="对比工卡版本、查看操作历史并导出闭环证据。" actions={<Button appearance="primary" icon={<ArrowDownloadRegular />} onClick={downloadAudit}>导出审计记录</Button>} />
+      <MergeQueue />
       <div className="audit-grid">
         <section className="panel diff-panel"><div className="panel-head"><div><h2>工卡版本差异</h2><span>R6 → R7 · 3 处变更</span></div><select value={selected} onChange={(event) => setSelected(event.target.value)}><option>R7</option><option>R6</option><option>R5</option></select></div><div className="diff-table"><div className="diff-head"><span>工卡</span><span>字段</span><span>原值</span><span>新值 / 原因</span></div>{diffs.map((diff) => <div className="diff-row" key={`${diff.card}-${diff.field}`}><strong>{diff.card}</strong><span>{diff.field}</span><del>{diff.from}</del><div><ins>{diff.to}</ins><small>{diff.reason}</small></div></div>)}</div></section>
         <section className="panel audit-panel"><div className="panel-head"><div><h2>完整审计时间线</h2><span>{state.audit.length} 条记录</span></div><HistoryRegular /></div>{state.audit.map((item, index) => <div className="audit-row" key={`${item.time}-${index}`}><span className="timeline-dot" /><div><strong>{item.action}</strong><p>{item.detail}</p><small>{item.time} · {item.actor}</small></div></div>)}</section>

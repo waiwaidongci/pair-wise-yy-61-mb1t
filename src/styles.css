@@ -141,6 +141,31 @@ button, input, textarea, select { font: inherit; }
 .release-gate-card h3 { margin: 10px 0; font-size: 13px; }
 .release-gate-card label { display: flex; align-items: center; gap: 4px; font-size: 10px; padding: 7px 0; border-top: 1px solid #edf1f3; }
 .audit-grid { grid-template-columns: minmax(0, 1.15fr) minmax(340px, .85fr); }
+
+.merge-badge { margin-right: 4px; }
+.merge-panel { margin-bottom: 15px; }
+.merge-panel .panel-head { flex-wrap: wrap; }
+.merge-actions { display: flex; gap: 8px; }
+.merge-offline-bar { margin: 0; border-radius: 0; border-left: 0; border-right: 0; }
+.merge-list { padding: 6px 14px; }
+.merge-empty { padding: 22px; text-align: center; color: var(--muted); font-size: 11px; }
+.merge-row { display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 12px; padding: 12px 0; border-bottom: 1px solid #edf1f3; align-items: start; }
+.merge-row:last-child { border-bottom: 0; }
+.merge-status { font-size: 10px; font-weight: 700; text-align: center; padding: 4px 0; border-radius: 4px; margin-top: 2px; }
+.merge-status.待并入 { background: #e1edf6; color: #145b91; }
+.merge-status.已并入 { background: #e0f2ea; color: var(--green); }
+.merge-status.待确认 { background: #fdf0e0; color: var(--amber); }
+.merge-status.失败 { background: #fae8e7; color: var(--red); }
+.merge-body { min-width: 0; }
+.merge-body strong { font-size: 12px; }
+.merge-body small { display: block; color: var(--muted); font-size: 9px; margin-top: 3px; }
+.merge-payload { color: #476477 !important; }
+.merge-conflict { margin: 6px 0 0; font-size: 10px; color: var(--amber); background: #fff7e8; border: 1px solid #efd5ae; border-radius: 4px; padding: 7px 9px; line-height: 1.5; }
+.merge-server-value { display: block; margin-top: 4px; color: #7a4a13; }
+.merge-error { margin: 6px 0 0; font-size: 10px; color: var(--red); background: #fdeceb; border: 1px solid #f0c4c2; border-radius: 4px; padding: 7px 9px; line-height: 1.5; }
+.merge-row-actions { display: flex; gap: 8px; margin-top: 7px; }
+.merge-foot { display: flex; gap: 18px; padding: 10px 14px; border-top: 1px solid var(--line); color: var(--muted); font-size: 10px; }
+.merge-foot span strong { color: #263f50; }
 .diff-panel select { height: 32px; border: 1px solid #ccd6dd; border-radius: 4px; background: white; padding: 0 8px; }
 .diff-table { overflow-x: auto; }
 .diff-head, .diff-row { min-width: 640px; display: grid; grid-template-columns: 100px 90px 1fr 1.25fr; gap: 10px; padding: 12px 14px; align-items: center; border-bottom: 1px solid #edf1f3; font-size: 11px; }

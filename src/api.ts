@@ -17,6 +17,41 @@ export type WorkCard = {
   stage: string;
 };
 
+/** 离线期间记录的一次改动（工卡改动 / 签字尝试 / 证据更新 / 放行锁定） */
+export type OfflineChange = {
+  requestId: string;
+  type: 'card' | 'signature' | 'evidence' | 'release';
+  targetId: string;
+  label: string;
+  payload: Record<string, unknown>;
+  /** 改动所基于的基线版本 */
+  baseVersion: number;
+  createdAt: string;
+  status: '待并入' | '已并入' | '待确认' | '失败';
+  error?: string;
+  attempts: number;
+  /** 冲突时服务器侧的最新值与原因 */
+  serverField?: string;
+  serverValue?: string;
+  serverReason?: string;
+};
+
+/** 合并导入的逐项结果 */
+export type MergeOutcome = {
+  requestId: string;
+  status: '已并入' | '待确认' | '失败';
+  reason?: string;
+  /** 冲突字段与服务器最新值（干净值，可用于回退现场改动） */
+  serverField?: string;
+  serverValue?: string;
+  /** 证据更新后需要重新待签的阶段 */
+  revertSignatures?: string[];
+  /** 证据更新后已放行包需要退回审阅 */
+  releaseReverted?: boolean;
+};
+
+export type MergeResult = { outcomes: MergeOutcome[]; serverRevision: number };
+
 const packageData = {
   id: 'WP-B7891-04',
   aircraft: 'B-7891',
@@ -49,6 +84,39 @@ const mockBaseQuery: BaseQueryFn = async (arg) => {
   return { error: { status: 404, data: 'Not found' } };
 };
 
+/** 阶段签署 -> 绑定的工卡（证据更新联动签字用） */
+const stageToCard: Record<string, string> = { '机械': 'CARD-01', '系统': 'CARD-03', '动力': 'CARD-07', '放行': 'CARD-08' };
+
+/** 服务器在最新版 R8 上已变更的字段（本地草稿基于 R7，回网合并时逐项比对） */
+const serverFieldChanges: Record<string, string[]> = {
+  'CARD-03': ['tolerance', 'status'],
+  'CARD-07': ['dependencies'],
+  'CARD-08': ['evidence']
+};
+
+const serverFieldLabels: Record<string, string> = {
+  tolerance: '容差',
+  status: '状态',
+  dependencies: '依赖',
+  evidence: '证据',
+  measurement: '测量值',
+  finding: '发现与处置'
+};
+
+const serverFieldValues: Record<string, Record<string, string>> = {
+  'CARD-03': {
+    tolerance: '≥ 2850 psi / 10 min（AMM 临时修订 TR-114）',
+    status: '执行中（服务器已记录授权继续）'
+  },
+  'CARD-07': { dependencies: 'CARD-03（试车前置条件调整）' },
+  'CARD-08': { evidence: '近 3 次记录（可靠性复核要求）' }
+};
+
+/** 服务器最新基线版本（比本地缓存 R7 新一版） */
+let serverRevision = 8;
+/** 导入调用计数：首次导入模拟一次瞬时失败，验证失败项保留与原编号重试 */
+let importAttempts = 0;
+
 export const maintenanceApi = createApi({
   reducerPath: 'maintenanceApi',
   baseQuery: mockBaseQuery,
@@ -67,8 +135,65 @@ export const maintenanceApi = createApi({
         return { data: { accepted: true, revision: packageData.serverRevision + 1 } };
       },
       invalidatesTags: ['Package']
+    }),
+    importOfflineChanges: builder.mutation<MergeResult, OfflineChange[]>({
+      queryFn: async (changes) => {
+        await new Promise((resolve) => setTimeout(resolve, 380));
+        importAttempts += 1;
+        if (importAttempts === 1) {
+          return {
+            error: {
+              status: 503,
+              data: { message: '导入服务暂时不可用，请稍后重试；现场改动已保留，重试仍使用原请求编号。' }
+            }
+          };
+        }
+        const evidenceInBatch = changes.some((change) => change.type === 'evidence');
+        const outcomes: MergeOutcome[] = changes.map((change) => {
+          if (change.type === 'card') {
+            const fields = Object.keys(change.payload).filter((field) => ['measurement', 'finding', 'status'].includes(field));
+            const hit = fields.find((field) => serverFieldChanges[change.targetId]?.includes(field));
+            if (change.baseVersion < serverRevision && hit) {
+              return {
+                requestId: change.requestId,
+                status: '待确认',
+                reason: `服务器已将${serverFieldLabels[hit] ?? hit}更新至最新版 R${serverRevision}，现场改动与服务器版本不一致，请确认保留现场改动或采用服务器版本。`,
+                serverField: hit,
+                serverValue: hit === 'status' ? '执行中' : serverFieldValues[change.targetId]?.[hit]
+              };
+            }
+            serverRevision += 1;
+            return { requestId: change.requestId, status: '已并入' };
+          }
+          if (change.type === 'signature') {
+            const cardId = stageToCard[change.targetId];
+            const evidenceChanged =
+              change.baseVersion < serverRevision && Boolean(cardId) && (serverFieldChanges[cardId]?.includes('evidence') ?? false);
+            return { requestId: change.requestId, status: '已并入', revertSignatures: evidenceChanged ? [change.targetId] : [] };
+          }
+          if (change.type === 'evidence') {
+            serverRevision += 1;
+            const affected = Object.entries(stageToCard)
+              .filter(([, cardId]) => serverFieldChanges[cardId]?.includes('evidence'))
+              .map(([stage]) => stage);
+            return { requestId: change.requestId, status: '已并入', revertSignatures: affected, releaseReverted: true };
+          }
+          if (change.type === 'release') {
+            return { requestId: change.requestId, status: '已并入', releaseReverted: false };
+          }
+          return { requestId: change.requestId, status: '已并入' };
+        });
+        // 证据更新会连带回退同一批次里的签字尝试与放行锁定
+        const revertedStages = new Set(outcomes.flatMap((outcome) => outcome.revertSignatures ?? []));
+        for (const outcome of outcomes) {
+          if (outcome.status === '已并入' && changes.find((change) => change.requestId === outcome.requestId)?.type === 'release') {
+            outcome.releaseReverted = evidenceInBatch || revertedStages.size > 0;
+          }
+        }
+        return { data: { outcomes, serverRevision } };
+      }
     })
   })
 });
 
-export const { useGetWorkPackageQuery, useSubmitCardMutation } = maintenanceApi;
+export const { useGetWorkPackageQuery, useSubmitCardMutation, useImportOfflineChangesMutation } = maintenanceApi;
